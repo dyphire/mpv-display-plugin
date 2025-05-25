@@ -1,7 +1,6 @@
 // Copyright (c) 2023 dyphire. All rights reserved.
 // SPDX-License-Identifier: GPL-2.0-only
 
-
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
@@ -13,7 +12,13 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#define INITGUID
+#include <dxgi1_6.h> 
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")
+
 #define MPV_EXPORT __declspec(dllexport)
+#define SAFE_RELEASE(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while(0)
 
 static mpv_handle *mpv = NULL;
 static HWND hwnd = NULL;
@@ -240,6 +245,138 @@ static void GetMonitorName(const DISPLAYCONFIG_MODE_INFO *mode, char *out, size_
     }
 }
 
+static HMONITOR get_hm_from_display_path(const DISPLAYCONFIG_PATH_INFO* path, DISPLAYCONFIG_MODE_INFO* modes, UINT32 modeCount) {
+    DISPLAYCONFIG_SOURCE_MODE* src_mode = NULL;
+    for (UINT32 k = 0; k < modeCount; k++) {
+        if (modes[k].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+            modes[k].id == path->sourceInfo.id &&
+            modes[k].adapterId.HighPart == path->sourceInfo.adapterId.HighPart &&
+            modes[k].adapterId.LowPart == path->sourceInfo.adapterId.LowPart) {
+            src_mode = &modes[k].sourceMode;
+            break;
+        }
+    }
+    if (!src_mode) return NULL;
+
+    RECT monitor_rect = {
+        .left   = src_mode->position.x,
+        .top    = src_mode->position.y,
+        .right  = src_mode->position.x + src_mode->width,
+        .bottom = src_mode->position.y + src_mode->height
+    };
+
+    return MonitorFromRect(&monitor_rect, MONITOR_DEFAULTTONULL);
+}
+
+// Helper function to convert DXGI_COLOR_SPACE_TYPE to string for primaries
+static const char *dxgi_primaries_to_str_local(DXGI_COLOR_SPACE_TYPE colorSpace) {
+    switch (colorSpace) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+        // case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709_SL: // This specific SL enum doesn't exist in standard dxgitype.h
+            return "BT.709";
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: // Linear gamma BT.709
+            return "BT.709"; // Primaries are still BT.709
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020:
+            return "BT.2020";
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020: // BT.2020 primaries with gamma 2.2
+             return "BT.2020";
+        default:
+            mpv_print("Unknown DXGI ColorSpace for primaries: %d", colorSpace);
+            return "Unknown";
+    }
+}
+ 
+// Helper function to convert DXGI_COLOR_SPACE_TYPE to string for transfer characteristics
+static const char *dxgi_transfer_to_str_local(DXGI_COLOR_SPACE_TYPE colorSpace) {
+    switch (colorSpace) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+        // case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709_SL:
+            return "sRGB"; // Explicitly G2.2, could also be sRGB or BT.1886 depending on context
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            return "Linear";
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020:
+            return "PQ";
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
+             return "sRGB";
+        default:
+            mpv_print("Unknown DXGI ColorSpace for transfer: %d", colorSpace);
+            return "Unknown";
+    }
+}
+
+static IDXGIFactory1* g_dxgiFactory = NULL;
+
+// New function to get DXGI_OUTPUT_DESC1 for a specific HMONITOR
+static bool get_dxgi_output_desc1_for_monitor(HMONITOR hMon, DXGI_OUTPUT_DESC1 *out_desc) {
+    if (!hMon || !out_desc) return false;
+
+    IDXGIFactory1 *dxgiFactory = NULL;
+    HRESULT hr;
+
+    // CreateDXGIFactory1 is a global function, so its call style is correct.
+    hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&dxgiFactory);
+    if (FAILED(hr) || !dxgiFactory) {
+        mpv_print("Failed to create DXGI Factory: 0x%lX", hr);
+        return false;
+    }
+
+    bool found_match = false;
+    for (UINT i = 0; ; ++i) { // Adapter loop
+        IDXGIAdapter1 *adapter = NULL;
+        // CORRECTED CALL:
+        hr = dxgiFactory->lpVtbl->EnumAdapters1(dxgiFactory, i, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break; // No more adapters
+        if (FAILED(hr) || !adapter) {
+            mpv_print("Error enumerating DXGI adapter %u: 0x%lX", i, hr);
+            continue;
+        }
+
+        for (UINT j = 0; ; ++j) { // Output loop
+            IDXGIOutput *output = NULL;
+            // CORRECTED CALL:
+            hr = adapter->lpVtbl->EnumOutputs(adapter, j, &output);
+            if (hr == DXGI_ERROR_NOT_FOUND) break; // No more outputs for this adapter
+            if (FAILED(hr) || !output) {
+                mpv_print("Error enumerating DXGI output %u on adapter %u: 0x%lX", j, i, hr);
+                continue;
+            }
+
+            DXGI_OUTPUT_DESC desc;
+            // CORRECTED CALL:
+            hr = output->lpVtbl->GetDesc(output, &desc);
+            if (SUCCEEDED(hr) && desc.Monitor == hMon) {
+                IDXGIOutput6 *output6 = NULL;
+                // CORRECTED CALL:
+                hr = output->lpVtbl->QueryInterface(output, &IID_IDXGIOutput6, (void **)&output6);
+                if (SUCCEEDED(hr) && output6) {
+                    // CORRECTED CALL:
+                    hr = output6->lpVtbl->GetDesc1(output6, out_desc);
+                    if (SUCCEEDED(hr)) {
+                        found_match = true;
+                    } else {
+                        mpv_print("IDXGIOutput6_GetDesc1 failed: 0x%lX", hr);
+                    }
+                    SAFE_RELEASE(output6); // SAFE_RELEASE already uses ->lpVtbl->Release
+                } else {
+                    mpv_print("QueryInterface for IDXGIOutput6 failed or IDXGIOutput6 not supported (0x%lX).", hr);
+                }
+            }
+            SAFE_RELEASE(output);
+            if (found_match) break;
+        }
+        SAFE_RELEASE(adapter);
+        if (found_match) break;
+    }
+
+    SAFE_RELEASE(dxgiFactory);
+
+    return found_match;
+}
+
 static void update_display_list() {
     HMONITOR current_monitor = GetWindowMonitor(hwnd);
 
@@ -271,6 +408,9 @@ static void update_display_list() {
 
     for (UINT32 i = 0; i < pathCount; i++) {
         DISPLAYCONFIG_PATH_INFO *path = &paths[i];
+
+        HMONITOR hMonitor = get_hm_from_display_path(path, modes, modeCount);
+        if (!hMonitor) continue;
 
         for (UINT32 j = 0; j < modeCount; j++) {
             if (modes[j].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET &&
@@ -317,6 +457,24 @@ static void update_display_list() {
                     default: break;
                 }
 
+                float max_luminance_val = 0.0f;
+                float min_luminance_val = 0.0f;
+                float max_full_frame_luminance_val = 0.0f;
+                const char *dxgi_primaries_str = "Unknown";
+                const char *dxgi_transfer_str = "Unknown";
+                DXGI_OUTPUT_DESC1 dxgi_desc1;
+                if (get_dxgi_output_desc1_for_monitor(hMonitor, &dxgi_desc1)) {
+                    max_luminance_val = dxgi_desc1.MaxLuminance;
+                    min_luminance_val = dxgi_desc1.MinLuminance;
+                    max_full_frame_luminance_val = dxgi_desc1.MaxFullFrameLuminance;
+                    dxgi_primaries_str = dxgi_primaries_to_str_local(dxgi_desc1.ColorSpace);
+                    dxgi_transfer_str = dxgi_transfer_to_str_local(dxgi_desc1.ColorSpace);
+                    mpv_print("DXGI Info: MaxL:%.2f, MinL:%.4f, Prim:%s, Trans:%s",
+                              max_luminance_val, min_luminance_val, dxgi_primaries_str, dxgi_transfer_str);
+                } else {
+                    mpv_print("Failed to get DXGI_OUTPUT_DESC1 for monitor.");
+                }
+
                 bool is_current = false;
                 MONITORINFOEX monInfo = { .cbSize = sizeof(monInfo) };
                 if (GetMonitorInfo(current_monitor, (MONITORINFO*)&monInfo)) {
@@ -335,13 +493,17 @@ static void update_display_list() {
                             is_current = true;
 
                             snprintf(current_json, sizeof(current_json),
-                                "{\"name\":\"%s\",\"uid\":\"%s\",\"hdr_supported\":%s,\"hdr_status\":\"%s\","
-                                "\"width\":%u,\"height\":%u,\"refresh_rate\":%.2f,\"bit_depth\":%d,"
-                                "\"technology\":\"%s\",\"current\":true}",
+                                "{\"name\":\"%s\",\"uid\":\"%s\",\"current\":true,\"hdr_supported\":%s,\"hdr_status\":\"%s\","
+                                "\"width\":%u,\"height\":%u,\"refresh_rate\":%.2f,\"bit_depth\":%u,"
+                                "\"primaries\":\"%s\",\"transfer\":\"%s\","
+                                "\"max_luminance\":%.2f,\"min_luminance\":%.4f,\"max_full_frame_luminance\":%.4f,"
+                                "\"technology\":\"%s\"}",
                                 name, uid,
                                 (status == HDR_STATUS_UNSUPPORTED ? "false" : "true"),
                                 hdr_status_to_str(status),
                                 width, height, refresh, bitDepth,
+                                dxgi_primaries_str, dxgi_transfer_str,
+                                max_luminance_val, min_luminance_val, max_full_frame_luminance_val,
                                 tech);
 
                             mpv_set_property_string(mpv, "user-data/display-info/name", name);
@@ -349,13 +511,19 @@ static void update_display_list() {
                             mpv_set_property_string(mpv, "user-data/display-info/hdr-supported", (status == HDR_STATUS_UNSUPPORTED) ? "false" : "true");
                             mpv_set_property_string(mpv, "user-data/display-info/hdr-status", hdr_status_to_str(status));
 
-                            char bitdepth_str[16];
-                            snprintf(bitdepth_str, sizeof(bitdepth_str), "%d", bitDepth);
-                            mpv_set_property_string(mpv, "user-data/display-info/bit-depth", bitdepth_str);
-
-                            char refresh_str[32];
-                            snprintf(refresh_str, sizeof(refresh_str), "%.2f", refresh);
-                            mpv_set_property_string(mpv, "user-data/display-info/refresh-rate", refresh_str);
+                            char temp_str[32];
+                            snprintf(temp_str, sizeof(temp_str), "%u", bitDepth);
+                            mpv_set_property_string(mpv, "user-data/display-info/bit-depth", temp_str);
+                            snprintf(temp_str, sizeof(temp_str), "%.2f", refresh);
+                            mpv_set_property_string(mpv, "user-data/display-info/refresh-rate", temp_str);
+                            snprintf(temp_str, sizeof(temp_str), "%.2f", max_luminance_val);
+                            mpv_set_property_string(mpv, "user-data/display-info/max-luminance", temp_str);
+                            snprintf(temp_str, sizeof(temp_str), "%.4f", min_luminance_val);
+                            mpv_set_property_string(mpv, "user-data/display-info/min-luminance", temp_str);
+                            snprintf(temp_str, sizeof(temp_str), "%.4f", max_full_frame_luminance_val);
+                            mpv_set_property_string(mpv, "user-data/display-info/max-full-frame-luminance", temp_str);
+                            mpv_set_property_string(mpv, "user-data/display-info/primaries", dxgi_primaries_str);
+                            mpv_set_property_string(mpv, "user-data/display-info/transfer", dxgi_transfer_str);
 
                             mpv_print("Display: %s, HDR: %s", name, hdr_status_to_str(status));
                         }
@@ -368,15 +536,18 @@ static void update_display_list() {
                         json[json_len] = '\0';
                     }
                     int written = snprintf(json + json_len, sizeof(json) - json_len,
-                        "{\"name\":\"%s\",\"uid\":\"%s\",\"hdr_supported\":%s,\"hdr_status\":\"%s\","
+                        "{\"name\":\"%s\",\"uid\":\"%s\",\"current\":%s, \"hdr_supported\":%s,\"hdr_status\":\"%s\","
                         "\"width\":%u,\"height\":%u,\"refresh_rate\":%.2f,\"bit_depth\":%d,"
-                        "\"technology\":\"%s\",\"current\":%s}",
-                        name, uid,
+                        "\"primaries\":\"%s\",\"transfer\":\"%s\","
+                        "\"max_luminance\":%.2f,\"min_luminance\":%.4f,\"max_full_frame_luminance\":%.4f,"
+                        "\"technology\":\"%s\"}",
+                        name, uid, is_current ? "true" : "false",
                         (status == HDR_STATUS_UNSUPPORTED ? "false" : "true"),
                         hdr_status_to_str(status),
                         width, height, refresh, bitDepth,
-                        tech,
-                        is_current ? "true" : "false");
+                        dxgi_primaries_str, dxgi_transfer_str,
+                        max_luminance_val, min_luminance_val, max_full_frame_luminance_val,
+                        tech);
                     if (written > 0 && (size_t)written < sizeof(json) - json_len) {
                         json_len += (size_t)written;
                     } else {
@@ -540,7 +711,7 @@ MPV_EXPORT int mpv_open_cplugin(mpv_handle *handle) {
 
     mpv_print("Plugin loaded and waiting for events...");
 
-    while (handle) {
+    while (mpv) {
         mpv_event *event = mpv_wait_event(mpv, -1);
         if (event->event_id == MPV_EVENT_SHUTDOWN) break;
 
@@ -557,5 +728,6 @@ MPV_EXPORT int mpv_open_cplugin(mpv_handle *handle) {
     }
 
     mpv_print("Plugin shutting down");
+    mpv_unobserve_property(mpv, 0);
     return 0;
 }
