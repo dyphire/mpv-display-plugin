@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: ["*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest libmpv
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $TOKEN = $env:TOKEN
+          $json = curl -s "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -H "Authorization: Bearer $TOKEN" | ConvertFrom-Json
+          $asset = $json.assets | Where-Object { $_.name -match "mpv-dev-x86_64-\d{8}-git" } | Select-Object -First 1
+          curl -L -o $asset.name $asset.browser_download_url
+          7z x -y $asset.name -olibmpv
+          cp -force -recurse libmpv/include/ ${{github.workspace}}/include/
+      - name: Setup MSVC + LLVM
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure and Build with clang-cl
+        run: |
+          mkdir build
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64 -T ClangCL -DMPV_INCLUDE_DIRS=${{github.workspace}}/include -DCMAKE_CONFIGURATION_TYPES="Release"
+          cmake --build . --config Release
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: display
+          path: build/Release/display-info.dll
